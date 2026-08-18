@@ -1,0 +1,12 @@
+RewriteEngine On
+RewriteBase /
+
+RewriteRule ^api/rtc$ api/rtc.php [L,QSA]
+RewriteRule ^api/auth$ api/auth.php [L,QSA]
+RewriteRule ^api/fn$ api/fn.php [L,QSA]
+
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^ - [L]
+
+RewriteRule ^ index.php [L]

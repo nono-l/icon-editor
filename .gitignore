@@ -14,6 +14,7 @@ screenshots/
 artifacts/
 attachments/
 *.local
-
 AGENTS.md
 startup.sh
+legacy/api/config.php
+legacy/app/legacy-index.html
