@@ -18,3 +18,5 @@ AGENTS.md
 startup.sh
 legacy/api/config.php
 legacy/app/legacy-index.html
+legacy/.upload-key
+legacy/.upload-tmp/

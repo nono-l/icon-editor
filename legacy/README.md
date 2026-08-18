@@ -4,7 +4,19 @@ Vercel は使いません。レンタルサーバー（Apache + PHP + MySQL）�
 
 フロントは **ビルド済みの React**（Babel/ESBuild で変換済み）です。サーバーに Node は不要です。
 
-## 1. このリポジトリでアプリを固める
+## 0. ファイルマネージャに1枚だけ置く
+
+1. [`upload.php`](upload.php) だけをサーバーの公開フォルダへ置く
+2. `https://あなたのドメイン/upload.php` を開く
+3. 合言葉を決める
+4. 次のいずれかの ZIP を上げる
+   - GitHub の **Code → Download ZIP**（中の `legacy/` を自動で拾う）
+   - `legacy/` フォルダを固めた ZIP
+   - `install.php` が直下にある ZIP
+5. 「設置へ進む」→ `install.php`
+
+設置が終わったら、同じ画面から `upload.php` を消してください。
+
 
 ```bash
 npm install
