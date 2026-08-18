@@ -16,6 +16,7 @@ import {
   Trash2,
   Type,
   Unlink2,
+  Users,
   X,
   ZoomIn,
   ZoomOut,
@@ -23,12 +24,27 @@ import {
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  inviteUrl,
+  loadImage,
+  normalizeRoom,
+  roomCode as makeRoomCode,
+  serializeDoc,
+  serializeLayer,
+  wireFromLayers,
+  useCanvasRoom,
+  type CanvasDoc,
+  type CanvasOp,
+  type LivePose,
+  type RosterSeat,
+} from "@/lib/canvas-room";
 import { cn } from "@/lib/utils";
 
 const ICON = { id: "icon" as const, w: 300, h: 300, label: "アイコン 300×300" };
 const OG = { id: "og" as const, w: 1200, h: 630, label: "OG 1200×630" };
-const PRESETS = [ICON, OG] as const;
-type PresetId = (typeof PRESETS)[number]["id"];
+const BASE_PRESETS = [ICON, OG];
+export type CanvasPreset = { id: string; w: number; h: number; label: string };
+type PresetId = string;
 const SNAP = 10;
 
 type GuideShape = "box" | "hline" | "vline" | "cross";
@@ -523,24 +539,73 @@ function layerLabel(layer: Layer): string {
   return `ガイド（${GUIDE_LABEL[layer.shape]}）`;
 }
 
+async function hydrateLayer(
+  w: import("@/lib/canvas-room").WireLayer,
+  prev: Map<string, Layer>,
+): Promise<Layer | null> {
+  if (w.kind === "image") {
+    const old = prev.get(w.id);
+    const reuse = old?.kind === "image" && old.img.src === w.src ? old.img : null;
+    const img = reuse ?? (await loadImage(w.src).catch(() => null));
+    if (!img) return null;
+    return {
+      id: w.id,
+      kind: "image",
+      name: w.name,
+      img,
+      x: w.x,
+      y: w.y,
+      scaleX: w.scaleX,
+      scaleY: w.scaleY,
+      rotate: w.rotate,
+      w: w.w,
+      h: w.h,
+      opacity: w.opacity,
+      keyColor: w.keyColor,
+      keyTolerance: w.keyTolerance,
+    };
+  }
+  return w as Layer;
+}
+
 export function IconEditor({
   open = true,
   onClose,
   variant = "page",
   initialPreset = "icon",
+  extraPresets = [],
+  extraBackgrounds = [],
+  hideBasePresets = false,
+  onExported,
+  onRegisterMaterial,
+  roomCode: roomFromParent,
+  onRoomChange,
+  displayName = "ゲスト",
+  enableCollab = false,
 }: {
   open?: boolean;
   onClose?: () => void;
   variant?: "modal" | "page";
   initialPreset?: PresetId;
+  extraPresets?: CanvasPreset[];
+  extraBackgrounds?: { id: string; label: string; color: string | null }[];
+  hideBasePresets?: boolean;
+  onExported?: (blob: Blob, meta: { width: number; height: number; dataUrl: string }) => void;
+  onRegisterMaterial?: (meta: { width: number; height: number; dataUrl: string }) => void;
+  roomCode?: string | null;
+  onRoomChange?: (code: string | null) => void;
+  displayName?: string;
+  enableCollab?: boolean;
 }) {
+  const presets = hideBasePresets ? extraPresets : [...BASE_PRESETS, ...extraPresets];
+  const backgrounds = [...BACKGROUNDS, ...extraBackgrounds];
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const [layers, setLayers] = useState<Layer[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [bg, setBg] = useState<string | null>(null);
   const [presetId, setPresetId] = useState<PresetId>(initialPreset);
-  const preset = PRESETS.find((p) => p.id === presetId) ?? ICON;
+  const preset = presets.find((p) => p.id === presetId) ?? presets[0] ?? ICON;
   const W = preset.w;
   const H = preset.h;
   const sizeRef = useRef({ w: W, h: H });
@@ -553,6 +618,9 @@ export function IconEditor({
   const lastLayerTap = useRef<{ id: string; t: number } | null>(null);
   const [lockAspect, setLockAspect] = useState(true);
   const [pinCanvas, setPinCanvas] = useState(false);
+  const [pinCollab, setPinCollab] = useState(false);
+  const [collabH, setCollabH] = useState(0);
+  const collabPinRef = useRef<HTMLDivElement>(null);
   const [narrow, setNarrow] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const drag = useRef<
@@ -573,6 +641,132 @@ export function IconEditor({
   const pinch = useRef<{ dist: number; scaleX: number; scaleY: number } | null>(null);
   const layersRef = useRef(layers);
   layersRef.current = layers;
+  const applyingRef = useRef(false);
+  const localDirtyRef = useRef(false);
+  const gotRemoteRef = useRef(false);
+  const docRef = useRef<CanvasDoc>({ v: 1, presetId: initialPreset, bg: null, layers: [] });
+  const [joinInput, setJoinInput] = useState("");
+  const [issuedUrl, setIssuedUrl] = useState("");
+  const [role, setRole] = useState<"host" | "peer">("peer");
+  const room = enableCollab ? normalizeRoom(roomFromParent || "") || null : null;
+  const hostOnly = !room || role === "host";
+
+  useEffect(() => {
+    if (!room) return;
+    try {
+      if (sessionStorage.getItem(`canvas-host-${room}`)) setRole("host");
+    } catch {
+      /* ignore */
+    }
+  }, [room]);
+
+  useEffect(() => {
+    if (!room) return;
+    docRef.current = {
+      v: 1,
+      presetId,
+      bg,
+      layers: wireFromLayers(layers, docRef.current),
+    };
+    let alive = true;
+    void serializeDoc(presetId, bg, layers).then((d) => {
+      if (alive) docRef.current = d;
+    });
+    return () => {
+      alive = false;
+    };
+  }, [layers, presetId, bg, room]);
+
+  const applyRemoteDoc = useCallback(async (doc: CanvasDoc) => {
+    applyingRef.current = true;
+    gotRemoteRef.current = true;
+    if (role !== "host") {
+      setPresetId(doc.presetId);
+      setBg(doc.bg);
+    }
+    const prev = new Map(layersRef.current.map((l) => [l.id, l]));
+    const next: Layer[] = [];
+    for (const w of doc.layers) {
+      const layer = await hydrateLayer(w, prev);
+      if (layer) next.push(layer);
+    }
+    setLayers(next);
+    queueMicrotask(() => {
+      applyingRef.current = false;
+    });
+  }, [role]);
+
+  const applyRemoteOp = useCallback(async (op: CanvasOp) => {
+    applyingRef.current = true;
+    gotRemoteRef.current = true;
+    if (op.type === "preset") {
+      if (role !== "host") setPresetId(op.presetId);
+    } else if (op.type === "bg") {
+      if (role !== "host") setBg(op.bg);
+    } else if (op.type === "clear") {
+      setLayers([]);
+    } else if (op.type === "remove") {
+      setLayers((ls) => ls.filter((l) => l.id !== op.id));
+    } else if (op.type === "reorder") {
+      setLayers((ls) => {
+        const map = new Map(ls.map((l) => [l.id, l]));
+        const next = op.ids.map((id) => map.get(id)).filter(Boolean) as Layer[];
+        for (const l of ls) if (!op.ids.includes(l.id)) next.push(l);
+        return next;
+      });
+    } else if (op.type === "patch") {
+      const { img: _img, ...safe } = op.patch as { img?: unknown };
+      setLayers((ls) => ls.map((l) => (l.id === op.id ? ({ ...l, ...safe } as Layer) : l)));
+    } else if (op.type === "add") {
+      const prev = new Map(layersRef.current.map((l) => [l.id, l]));
+      if (prev.has(op.layer.id)) {
+        applyingRef.current = false;
+        return;
+      }
+      const layer = await hydrateLayer(op.layer, prev);
+      if (layer) setLayers((ls) => (ls.some((l) => l.id === layer.id) ? ls : [...ls, layer]));
+    }
+    queueMicrotask(() => {
+      applyingRef.current = false;
+    });
+  }, [role]);
+
+  const collab = useCanvasRoom({
+    room,
+    name: displayName.slice(0, 16) || "ゲスト",
+    role,
+    getDoc: () => docRef.current,
+    onDoc: (doc) => {
+      void applyRemoteDoc(doc);
+    },
+    onLive: (pose: LivePose) => {
+      if (drag.current?.id === pose.id) return;
+      setLayers((ls) =>
+        ls.map((l) =>
+          l.id === pose.id
+            ? { ...l, x: pose.x, y: pose.y, scaleX: pose.scaleX, scaleY: pose.scaleY, rotate: pose.rotate }
+            : l,
+        ),
+      );
+    },
+    onOp: (op) => {
+      void applyRemoteOp(op);
+    },
+  });
+  const collabRef = useRef(collab);
+  collabRef.current = collab;
+
+  useEffect(() => {
+    if (!collab || applyingRef.current) return;
+    if (role !== "host" && !gotRemoteRef.current) return;
+    if (!localDirtyRef.current) return;
+    const t = window.setTimeout(() => {
+      if (!localDirtyRef.current) return;
+      localDirtyRef.current = false;
+      collab.publish();
+    }, 240);
+    return () => window.clearTimeout(t);
+  }, [layers, presetId, bg, collab?.publish, role]);
 
   const selectedLayer = layers.find((l) => l.id === selected) ?? null;
 
@@ -613,7 +807,22 @@ export function IconEditor({
     if (selectedLayer) {
       drawHandles(ctx, selectedLayer);
     }
-  }, [bg, layers, selected, selectedLayer, snap, W, H]);
+    if (collab?.cursors.length) {
+      for (const c of collab.cursors) {
+        ctx.save();
+        ctx.fillStyle = c.color;
+        ctx.beginPath();
+        ctx.moveTo(c.x, c.y);
+        ctx.lineTo(c.x + 4, c.y + 14);
+        ctx.lineTo(c.x + 10, c.y + 10);
+        ctx.closePath();
+        ctx.fill();
+        ctx.font = '600 11px "Hiragino Sans", "Noto Sans JP", sans-serif';
+        ctx.fillText(c.name, c.x + 12, c.y + 12);
+        ctx.restore();
+      }
+    }
+  }, [bg, layers, selected, selectedLayer, snap, W, H, collab?.cursors]);
 
   useEffect(() => {
     paint();
@@ -640,13 +849,45 @@ export function IconEditor({
     } catch {
       setPinCanvas(window.matchMedia("(max-width: 639px)").matches);
     }
+    try {
+      const saved = localStorage.getItem("yotei-icon-pin-collab");
+      if (saved === "1") setPinCollab(true);
+      else setPinCollab(false);
+    } catch {
+      setPinCollab(false);
+    }
   }, []);
+
+  useEffect(() => {
+    const el = collabPinRef.current;
+    if (!el) {
+      setCollabH(0);
+      return;
+    }
+    const measure = () => setCollabH(el.getBoundingClientRect().height);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [enableCollab, room, role, issuedUrl, pinCollab]);
 
   function togglePinCanvas() {
     setPinCanvas((v) => {
       const next = !v;
       try {
         localStorage.setItem("yotei-icon-pin-canvas", next ? "1" : "0");
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }
+
+  function togglePinCollab() {
+    setPinCollab((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem("yotei-icon-pin-collab", next ? "1" : "0");
       } catch {
         /* ignore */
       }
@@ -698,8 +939,25 @@ export function IconEditor({
     setSelected(layer.id);
   }
 
+  function touchLocal() {
+    localDirtyRef.current = true;
+  }
+
+  function emitOp(op: CanvasOp) {
+    if (applyingRef.current) return;
+    collabRef.current?.sendOp(op);
+  }
+
   function updateLayer(id: string, patch: Partial<Layer>) {
+    touchLocal();
     setLayers((ls) => ls.map((l) => (l.id === id ? ({ ...l, ...patch } as Layer) : l)));
+    const poseOnly = Object.keys(patch).every((k) =>
+      ["x", "y", "scaleX", "scaleY", "rotate"].includes(k),
+    );
+    if (!poseOnly) {
+      const { img: _img, ...safe } = patch as Partial<Layer> & { img?: unknown };
+      emitOp({ type: "patch", id, patch: safe });
+    }
   }
 
   function addImage(file: File) {
@@ -723,8 +981,10 @@ export function IconEditor({
         keyColor: null,
         keyTolerance: 18,
       };
+      touchLocal();
       setLayers((ls) => [...ls, layer]);
       setSelected(layer.id);
+      void serializeLayer(layer).then((wire) => emitOp({ type: "add", layer: wire }));
     };
     img.src = url;
   }
@@ -753,8 +1013,10 @@ export function IconEditor({
       shadowX: 2,
       shadowY: 2,
     };
+    touchLocal();
     setLayers((ls) => [...ls, layer]);
     setSelected(layer.id);
+    void serializeLayer(layer).then((wire) => emitOp({ type: "add", layer: wire }));
   }
 
   function addGuide(shape: GuideShape) {
@@ -771,8 +1033,10 @@ export function IconEditor({
       w: shape === "vline" ? 12 : 180,
       h: shape === "hline" ? 12 : 180,
     };
+    touchLocal();
     setLayers((ls) => [...ls, layer]);
     setSelected(layer.id);
+    void serializeLayer(layer).then((wire) => emitOp({ type: "add", layer: wire }));
   }
 
   function fitSelected() {
@@ -789,17 +1053,18 @@ export function IconEditor({
 
   function moveZ(dir: "top" | "up" | "down" | "bottom") {
     if (!selected) return;
-    setLayers((ls) => {
-      const i = ls.findIndex((l) => l.id === selected);
-      if (i < 0) return ls;
-      const next = [...ls];
-      const [item] = next.splice(i, 1);
-      if (dir === "top") next.push(item);
-      else if (dir === "bottom") next.unshift(item);
-      else if (dir === "up") next.splice(Math.min(i + 1, next.length), 0, item);
-      else next.splice(Math.max(i - 1, 0), 0, item);
-      return next;
-    });
+    touchLocal();
+    const ls = layersRef.current;
+    const i = ls.findIndex((l) => l.id === selected);
+    if (i < 0) return;
+    const next = [...ls];
+    const [item] = next.splice(i, 1);
+    if (dir === "top") next.push(item);
+    else if (dir === "bottom") next.unshift(item);
+    else if (dir === "up") next.splice(Math.min(i + 1, next.length), 0, item);
+    else next.splice(Math.max(i - 1, 0), 0, item);
+    setLayers(next);
+    emitOp({ type: "reorder", ids: next.map((l) => l.id) });
   }
 
   function canvasPoint(e: React.PointerEvent | PointerEvent | React.WheelEvent): {
@@ -878,8 +1143,9 @@ export function IconEditor({
   }
 
   function onPointerMove(e: React.PointerEvent<HTMLCanvasElement>) {
-    if (!drag.current) return;
     const p = canvasPoint(e);
+    collab?.sendCursor(p.x, p.y);
+    if (!drag.current) return;
     const moving = layersRef.current.find((l) => l.id === drag.current!.id);
     if (!moving) return;
 
@@ -887,6 +1153,14 @@ export function IconEditor({
       const angle = Math.atan2(p.y - moving.y, p.x - moving.x);
       const deg = drag.current.startRotate + ((angle - drag.current.startAngle) * 180) / Math.PI;
       updateLayer(moving.id, { rotate: deg });
+      collab?.sendLive({
+        id: moving.id,
+        x: moving.x,
+        y: moving.y,
+        scaleX: moving.scaleX,
+        scaleY: moving.scaleY,
+        rotate: deg,
+      });
       return;
     }
 
@@ -919,6 +1193,14 @@ export function IconEditor({
         if (onlyY) nextY = clampScale(drag.current.startSY * Math.abs(ry));
       }
       updateLayer(moving.id, { scaleX: nextX, scaleY: nextY });
+      collab?.sendLive({
+        id: moving.id,
+        x: moving.x,
+        y: moving.y,
+        scaleX: nextX,
+        scaleY: nextY,
+        rotate: moving.rotate,
+      });
       return;
     }
 
@@ -934,6 +1216,17 @@ export function IconEditor({
     );
     setSnap({ v: snapped.v, h: snapped.h });
     updateLayer(drag.current.id, { x: snapped.x, y: snapped.y });
+    const live = layersRef.current.find((l) => l.id === drag.current!.id);
+    if (live) {
+      collab?.sendLive({
+        id: live.id,
+        x: snapped.x,
+        y: snapped.y,
+        scaleX: live.scaleX,
+        scaleY: live.scaleY,
+        rotate: live.rotate,
+      });
+    }
   }
 
   function onPointerUp() {
@@ -1017,13 +1310,21 @@ export function IconEditor({
   }
 
   async function download() {
-    const filename = presetId === "og" ? "icon-og-1200x630.png" : "icon-300.png";
+    const filename = `${preset.id}-${W}x${H}.png`;
     const blob = await exportBlob("png");
     if (!blob) {
       toast.error("書き出しに失敗しました");
       return;
     }
     const file = new File([blob], filename, { type: "image/png" });
+    if (onExported) {
+      const dataUrl = await new Promise<string>((resolve) => {
+        const r = new FileReader();
+        r.onload = () => resolve(String(r.result || ""));
+        r.readAsDataURL(blob);
+      });
+      onExported(blob, { width: W, height: H, dataUrl });
+    }
     const shareData: ShareData = { files: [file], title: filename };
     if (typeof navigator.canShare === "function" && navigator.canShare(shareData)) {
       try {
@@ -1052,6 +1353,20 @@ export function IconEditor({
     a.remove();
     window.setTimeout(() => URL.revokeObjectURL(url), 4000);
     toast.success(`PNGをダウンロードしました（${W}×${H}）`);
+  }
+
+  async function registerAsMaterial() {
+    const blob = await exportBlob("png");
+    if (!blob || !onRegisterMaterial) {
+      toast.error("書き出しに失敗しました");
+      return;
+    }
+    const dataUrl = await new Promise<string>((resolve) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result || ""));
+      r.readAsDataURL(blob);
+    });
+    onRegisterMaterial({ width: W, height: H, dataUrl });
   }
 
   if (!open) return null;
@@ -1101,23 +1416,166 @@ export function IconEditor({
           isPage ? "" : "min-h-0 flex-1 overflow-y-auto",
         )}
       >
+        {enableCollab && (
+          <div
+            ref={collabPinRef}
+            className={cn(
+              "mx-auto mb-3 w-full max-w-[20rem] sm:max-w-none",
+              pinCollab &&
+                "sticky z-40 -mx-4 border-b border-border bg-bg-elevated/95 px-4 py-2 backdrop-blur-md",
+            )}
+            style={
+              pinCollab
+                ? { top: "var(--grok-banner-h, 0px)" }
+                : undefined
+            }
+          >
+            <div className="rounded-[var(--radius-md)] border border-border bg-bg-subtle p-2">
+              <div className="flex items-center gap-2">
+                <Users className="size-3.5 shrink-0 text-primary" />
+                <span className="text-xs font-medium">みんなで編集</span>
+                {room && (
+                  <span className="text-[11px] text-primary">
+                    {role === "host" ? "ホスト" : "参加中"}
+                  </span>
+                )}
+                <label className="ml-auto flex shrink-0 items-center gap-1.5 text-[11px] text-fg-muted">
+                  <input
+                    type="checkbox"
+                    checked={pinCollab}
+                    onChange={togglePinCollab}
+                    className="size-4 accent-[var(--color-primary)]"
+                  />
+                  追従
+                </label>
+              </div>
+              {room ? (
+                <div className="mt-2 space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-mono text-sm text-primary">{room}</span>
+                    <Button type="button" size="sm" variant="outline" onClick={() => collab?.rejoin()}>
+                      再接続
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => {
+                        setIssuedUrl("");
+                        onRoomChange?.(null);
+                      }}
+                    >
+                      退出
+                    </Button>
+                  </div>
+                  {collab && <CollabRoster seats={collab.roster} joined={collab.joined} />}
+                  {role === "host" && (
+                    <div className="space-y-1.5">
+                      <Button
+                        type="button"
+                        size="sm"
+                        onClick={() => {
+                          const url = inviteUrl(room);
+                          setIssuedUrl(url);
+                          void navigator.clipboard.writeText(url).then(
+                            () => toast.success("招待URLを発行してコピーしました"),
+                            () => toast.message(url),
+                          );
+                        }}
+                      >
+                        <Link2 className="size-3.5" />
+                        招待URLを発行
+                      </Button>
+                      {issuedUrl && (
+                        <button
+                          type="button"
+                          className="block w-full truncate text-left font-mono text-[11px] text-primary"
+                          onClick={() => {
+                            void navigator.clipboard.writeText(issuedUrl).then(
+                              () => toast.success("招待URLをコピーしました"),
+                              () => toast.message(issuedUrl),
+                            );
+                          }}
+                        >
+                          {issuedUrl}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={() => {
+                      const code = makeRoomCode();
+                      try {
+                        sessionStorage.setItem(`canvas-host-${code}`, "1");
+                      } catch {
+                        /* ignore */
+                      }
+                      setRole("host");
+                      onRoomChange?.(code);
+                      setIssuedUrl(inviteUrl(code));
+                    }}
+                  >
+                    部屋をつくる
+                  </Button>
+                  <Input
+                    value={joinInput}
+                    onChange={(e) => setJoinInput(e.target.value.toUpperCase())}
+                    placeholder="部屋コード"
+                    className="h-9 max-w-[8rem] font-mono"
+                    maxLength={16}
+                  />
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={!normalizeRoom(joinInput)}
+                    onClick={() => {
+                      const code = normalizeRoom(joinInput);
+                      if (!code) return;
+                      setRole("peer");
+                      onRoomChange?.(code);
+                    }}
+                  >
+                    入る
+                  </Button>
+                </div>
+              )}
+              <p className="mt-1 text-[11px] text-fg-subtle">
+                ホストが招待URLを発行すると、相手はそのリンクからそのまま部屋に入れます。
+              </p>
+            </div>
+          </div>
+        )}
+
         <div
           className={cn(
             "mx-auto grid place-items-center",
             pinCanvas &&
               "sticky z-30 -mx-4 border-b border-border bg-bg-elevated/95 px-4 py-2 backdrop-blur-md",
-            pinCanvas && isPage && "top-[calc(var(--grok-banner-h,0px)+3.55rem)]",
-            pinCanvas && !isPage && "top-0",
           )}
+          style={
+            pinCanvas
+              ? {
+                  top: `calc(var(--grok-banner-h, 0px)${
+                    pinCollab && enableCollab ? ` + ${collabH}px` : ""
+                  })`,
+                }
+              : undefined
+          }
         >
-          <label className="mb-2 flex min-h-11 w-full max-w-[20rem] items-center gap-2 text-xs text-fg-muted sm:max-w-none">
+          <label className="mb-1.5 flex items-center gap-2 text-xs text-fg-muted">
             <input
               type="checkbox"
               checked={pinCanvas}
               onChange={togglePinCanvas}
-              className="size-5 accent-[var(--color-primary)]"
+              className="size-4 accent-[var(--color-primary)]"
             />
-            キャンバスをスクロールに追従（スマホ向け）
+            キャンバスをスクロールに追従
           </label>
           <div className="relative rounded-[var(--radius-md)] border border-border-strong bg-bg p-2 sm:p-3">
             <canvas
@@ -1132,13 +1590,7 @@ export function IconEditor({
                 width: "100%",
                 height: "auto",
                 maxWidth:
-                  pinCanvas && narrow
-                    ? presetId === "og"
-                      ? 280
-                      : 176
-                    : presetId === "og"
-                      ? 560
-                      : 300,
+                  pinCanvas && narrow ? (W / H > 1.4 ? 280 : 176) : W / H > 1.4 ? 560 : 300,
                 maxHeight: pinCanvas && narrow ? "32vh" : undefined,
                 aspectRatio: `${W} / ${H}`,
               }}
@@ -1160,15 +1612,26 @@ export function IconEditor({
         </div>
 
         <div className="mt-4">
-          <p className="mb-1.5 text-xs font-medium text-fg-subtle">書き出しサイズ</p>
+          <p className="mb-1.5 text-xs font-medium text-fg-subtle">
+            書き出しサイズ
+            {room && !hostOnly && (
+              <span className="ml-2 font-normal text-fg-subtle/80">ホストのみ変更可</span>
+            )}
+          </p>
           <div className="grid grid-cols-2 gap-2">
-            {PRESETS.map((p) => (
+            {presets.map((p) => (
               <Button
                 key={p.id}
                 type="button"
                 size="sm"
                 variant={presetId === p.id ? "secondary" : "outline"}
-                onClick={() => setPresetId(p.id)}
+                disabled={!hostOnly && presetId !== p.id}
+                onClick={() => {
+                  if (!hostOnly) return;
+                  touchLocal();
+                  setPresetId(p.id);
+                  emitOp({ type: "preset", presetId: p.id });
+                }}
               >
                 {p.label}
               </Button>
@@ -1201,9 +1664,16 @@ export function IconEditor({
             variant="ghost"
             size="sm"
             onClick={() => {
+              if (!hostOnly) {
+                toast.message("全消去はホストだけできます");
+                return;
+              }
               setLayers([]);
               setSelected(null);
+              touchLocal();
+              emitOp({ type: "clear" });
             }}
+            disabled={!!room && !hostOnly}
           >
             全消去
           </Button>
@@ -1243,17 +1713,26 @@ export function IconEditor({
         <div className="mt-4">
           <p className="mb-1.5 text-xs font-medium text-fg-subtle">
             背景
-            <span className="ml-2 font-normal text-fg-subtle/80">なし＝透過PNG</span>
+            <span className="ml-2 font-normal text-fg-subtle/80">
+              {room && !hostOnly ? "ホストのみ変更可" : "なし＝透過PNG"}
+            </span>
           </p>
           <div className="flex flex-wrap gap-2">
-            {BACKGROUNDS.map((b) => (
+            {backgrounds.map((b) => (
               <button
                 key={b.id}
                 type="button"
-                onClick={() => setBg(b.color)}
+                disabled={!hostOnly && bg !== b.color}
+                onClick={() => {
+                  if (!hostOnly) return;
+                  touchLocal();
+                  setBg(b.color);
+                  emitOp({ type: "bg", bg: b.color });
+                }}
                 className={cn(
                   "min-h-11 rounded-[var(--radius-md)] border px-3 text-xs font-medium",
                   bg === b.color ? "border-primary text-primary" : "border-border text-fg-muted",
+                  !hostOnly && bg !== b.color && "opacity-50",
                   !b.color &&
                     "bg-[repeating-conic-gradient(#2a2c31_0%_25%,#17181c_0%_50%)] bg-[length:12px_12px]",
                 )}
@@ -1722,8 +2201,10 @@ export function IconEditor({
                 variant="danger"
                 size="sm"
                 onClick={() => {
+                  touchLocal();
                   setLayers((ls) => ls.filter((l) => l.id !== selectedLayer.id));
                   setSelected(null);
+                  emitOp({ type: "remove", id: selectedLayer.id });
                 }}
               >
                 <Trash2 className="size-3.5" />
@@ -1746,9 +2227,14 @@ export function IconEditor({
             <Download className="hidden size-4 sm:block" />
             {narrow ? "保存" : bg ? "PNGを保存" : "透過PNGを保存"}
           </Button>
+          {onRegisterMaterial && (
+            <Button type="button" variant="secondary" onClick={() => void registerAsMaterial()}>
+              素材登録
+            </Button>
+          )}
         </div>
         <p className="text-center text-[11px] text-fg-subtle">
-          ブラウザだけで完結。iPhone は共有シートから写真に追加できます。
+          素材登録はログイン済みのチケット1枚。外部ストレージ設定があるときだけ送れます。
         </p>
         {!isPage && onClose && (
           <Button type="button" variant="ghost" className="w-full" onClick={onClose}>
@@ -1804,6 +2290,129 @@ export function IconEditor({
     >
       {body}
       {preview}
+    </div>
+  );
+}
+
+function linkMeta(seat: RosterSeat) {
+  if (seat.via === "server") {
+    return { label: "サーバー経由", tone: "bg-primary/45", text: "text-fg-muted" };
+  }
+  if (seat.connectionState === "self" || seat.connectionState === "connected") {
+    return { label: "つながってる", tone: "bg-primary", text: "text-primary" };
+  }
+  if (seat.connectionState === "connecting" || seat.connectionState === "new") {
+    return { label: "つなぎ中", tone: "bg-primary/45 animate-pulse", text: "text-fg-muted" };
+  }
+  if (seat.connectionState === "failed") {
+    return { label: "届かない", tone: "bg-fg-muted", text: "text-fg-subtle" };
+  }
+  if (seat.connectionState === "disconnected") {
+    return { label: "切れた", tone: "bg-fg-subtle", text: "text-fg-subtle" };
+  }
+  return { label: "待機", tone: "bg-fg-subtle", text: "text-fg-subtle" };
+}
+
+function pathLabel(kind: string | null) {
+  if (kind === "host") return "同じ回線";
+  if (kind === "srflx" || kind === "prflx") return "直通";
+  if (kind === "relay") return "中継";
+  return null;
+}
+
+function CollabRoster({ seats, joined }: { seats: RosterSeat[]; joined: boolean }) {
+  const direct = seats.filter((s) => s.self || (s.connectionState === "connected" && !s.via)).length;
+  const viaServer = seats.filter((s) => s.via === "server").length;
+  const host = seats.find((s) => s.role === "host");
+  const others = seats.filter((s) => s !== host);
+  const [, bump] = useState(0);
+  useEffect(() => {
+    const t = window.setInterval(() => bump((n) => n + 1), 250);
+    return () => window.clearInterval(t);
+  }, []);
+
+  return (
+    <div className="rounded-[var(--radius-sm)] border border-border bg-bg px-2 py-2">
+      <div className="mb-1.5 flex items-baseline justify-between gap-2">
+        <p className="text-[11px] text-fg-subtle">
+          {joined
+            ? viaServer
+              ? `直結 ${direct} · サーバー ${viaServer}`
+              : `つながってる ${direct} / ${seats.length}`
+            : "部屋に入っています…"}
+        </p>
+        {host && (
+          <p className="text-[11px] text-primary">
+            ホスト {host.self ? "自分" : host.name}
+          </p>
+        )}
+      </div>
+      <div className="flex flex-col gap-1.5">
+        {host && <SeatRow seat={host} seats={seats} />}
+        {others.map((seat) => (
+          <div key={seat.id} className="flex gap-2">
+            <div className="flex w-3 flex-col items-center">
+              <div className={cn("h-3 w-px shrink-0 bg-border")} />
+              <div className={cn("size-1.5 shrink-0 rounded-full", linkMeta(seat).tone)} />
+              <div className="w-px min-h-3 flex-1 bg-border" />
+            </div>
+            <div className="min-w-0 flex-1 pb-0.5">
+              <SeatRow seat={seat} seats={seats} />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ago(at: number | null | undefined) {
+  if (at == null) return "—";
+  return `${Math.max(0, Date.now() - at)}ms前`;
+}
+
+function viaName(seats: RosterSeat[], id: string) {
+  if (id === "server") return "サーバー";
+  const s = seats.find((x) => x.id === id);
+  return s ? s.name.replace("（自分）", "") : "中継";
+}
+
+function SeatRow({ seat, seats }: { seat: RosterSeat; seats: RosterSeat[] }) {
+  const st = linkMeta(seat);
+  const path = pathLabel(seat.candidateType);
+  const server = seat.via === "server" || seat.self;
+  return (
+    <div className="flex min-h-8 items-center gap-2">
+      <span
+        className="grid size-7 shrink-0 place-items-center rounded-full text-[10px] font-bold text-bg"
+        style={{ background: seat.color }}
+        title={seat.id}
+      >
+        {(seat.name.replace("（自分）", "") || "?").slice(0, 1)}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1.5">
+          <span className="truncate text-xs font-medium">{seat.name}</span>
+          {seat.role === "host" && (
+            <span className="shrink-0 rounded-full bg-primary/15 px-1.5 py-px text-[9px] font-bold text-primary">
+              ホスト
+            </span>
+          )}
+          {seat.proxy && (
+            <span className="shrink-0 rounded-full bg-primary/15 px-1.5 py-px text-[9px] font-bold text-primary">
+              中継
+            </span>
+          )}
+        </div>
+        <p className={cn("text-[10px] leading-tight", st.text)}>
+          {st.label}
+          {seat.via && seat.via !== "server" ? ` · ${viaName(seats, seat.via)} 経由` : ""}
+          {seat.sameIp && !seat.via ? " · 同じ回線" : ""}
+          {server ? ` · POLL ${ago(seat.lastPollAt)}` : ` · HB ${ago(seat.lastHbAt)}`}
+          {!server && seat.rttMs != null ? ` · 往復${seat.rttMs}ms` : ""}
+          {path && !seat.via ? ` · ${path}` : ""}
+        </p>
+      </div>
     </div>
   );
 }
