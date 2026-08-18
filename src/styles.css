@@ -1,0 +1,54 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@theme {
+  --font-sans: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP",
+    "Segoe UI", system-ui, -apple-system, sans-serif;
+  --color-bg: #0a0b0d;
+  --color-bg-elevated: #12141a;
+  --color-bg-subtle: #1a1d26;
+  --color-fg: #eef0f4;
+  --color-fg-muted: #9aa3b2;
+  --color-fg-subtle: #6b7385;
+  --color-border: #2a2f3a;
+  --color-border-strong: #3a4150;
+  --color-primary: #7dd3c0;
+  --color-primary-fg: #0a0b0d;
+  --color-live: #f07178;
+  --color-ring: #7dd3c0;
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --radius-xl: 1.5rem;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+  html {
+    color-scheme: dark;
+  }
+  body {
+    margin: 0;
+    min-height: 100dvh;
+    background: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+@layer utilities {
+  .focus-ring {
+    outline: none;
+  }
+  .focus-ring:focus-visible {
+    box-shadow: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-ring);
+  }
+}
